@@ -66,7 +66,12 @@ struct osfs_inode {
     struct timespec64 __i_atime;        // Last access time
     struct timespec64 __i_mtime;        // Last modification time
     struct timespec64 __i_ctime;        // Creation time
-    uint32_t i_block;                   // Simplified handling, single data block pointer
+#define OSFS_N_BLOCKS 15
+    #define OSFS_DIRECT_BLOCKS 12
+    #define OSFS_INDIRECT_BLOCK 12
+    #define OSFS_DOUBLE_INDIRECT_BLOCK 13
+    
+    uint32_t i_block[OSFS_N_BLOCKS];    // Block pointers: 0-11 direct, 12 indirect, 13 double indirect
 };
 
 struct inode *osfs_iget(struct super_block *sb, unsigned long ino);

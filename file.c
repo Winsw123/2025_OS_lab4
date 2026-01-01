@@ -15,17 +15,124 @@
  *   - 0 if the end of the file is reached.
  *   - -EFAULT if copying data to user space fails.
  */
+/**
+ * Function: osfs_get_block
+ * Description: Maps a file's logical block index to a physical block number.
+ *              Allocates blocks if necessary and allowed.
+ */
+static int osfs_get_block(struct osfs_inode *osfs_inode, struct osfs_sb_info *sb_info, uint32_t block_index, uint32_t *phys_block, int allocate)
+{
+    int ret;
+    uint32_t *indirect_block;
+    uint32_t *double_indirect_block;
+    void *block_addr;
+
+    // 1. Direct Blocks
+    if (block_index < OSFS_DIRECT_BLOCKS) {
+        if (osfs_inode->i_block[block_index] == 0) {
+            if (!allocate) return -1; // Block not exists
+            ret = osfs_alloc_data_block(sb_info, &osfs_inode->i_block[block_index]);
+            if (ret) return ret;
+            osfs_inode->i_blocks++;
+        }
+        *phys_block = osfs_inode->i_block[block_index];
+        return 0;
+    }
+
+    block_index -= OSFS_DIRECT_BLOCKS;
+
+    // 2. Indirect Blocks
+    if (block_index < BLOCK_SIZE / sizeof(uint32_t)) {
+        if (osfs_inode->i_block[OSFS_INDIRECT_BLOCK] == 0) {
+            if (!allocate) return -1;
+            ret = osfs_alloc_data_block(sb_info, &osfs_inode->i_block[OSFS_INDIRECT_BLOCK]);
+            if (ret) return ret;
+            osfs_inode->i_blocks++;
+            
+            // Initialize indirect block with 0
+            block_addr = sb_info->data_blocks + osfs_inode->i_block[OSFS_INDIRECT_BLOCK] * BLOCK_SIZE;
+            memset(block_addr, 0, BLOCK_SIZE);
+        }
+
+        block_addr = sb_info->data_blocks + osfs_inode->i_block[OSFS_INDIRECT_BLOCK] * BLOCK_SIZE;
+        indirect_block = (uint32_t *)block_addr;
+
+        if (indirect_block[block_index] == 0) {
+            if (!allocate) return -1;
+            ret = osfs_alloc_data_block(sb_info, &indirect_block[block_index]);
+            if (ret) return ret;
+            osfs_inode->i_blocks++;
+        }
+        *phys_block = indirect_block[block_index];
+        return 0;
+    }
+
+    block_index -= BLOCK_SIZE / sizeof(uint32_t);
+
+    // 3. Double Indirect Blocks
+    // Calculate indices for double indirect block
+    uint32_t pointers_per_block = BLOCK_SIZE / sizeof(uint32_t);
+    uint32_t double_idx = block_index / pointers_per_block;
+    uint32_t single_idx = block_index % pointers_per_block;
+
+    if (double_idx < pointers_per_block) {
+        // Double Indirect Block pointer in inode
+        if (osfs_inode->i_block[OSFS_DOUBLE_INDIRECT_BLOCK] == 0) {
+            if (!allocate) return -1;
+            ret = osfs_alloc_data_block(sb_info, &osfs_inode->i_block[OSFS_DOUBLE_INDIRECT_BLOCK]);
+            if (ret) return ret;
+            osfs_inode->i_blocks++;
+            
+            // Zero out
+            block_addr = sb_info->data_blocks + osfs_inode->i_block[OSFS_DOUBLE_INDIRECT_BLOCK] * BLOCK_SIZE;
+            memset(block_addr, 0, BLOCK_SIZE);
+        }
+
+        // First level indirect block
+        block_addr = sb_info->data_blocks + osfs_inode->i_block[OSFS_DOUBLE_INDIRECT_BLOCK] * BLOCK_SIZE;
+        double_indirect_block = (uint32_t *)block_addr;
+
+        if (double_indirect_block[double_idx] == 0) {
+            if (!allocate) return -1;
+            ret = osfs_alloc_data_block(sb_info, &double_indirect_block[double_idx]);
+            if (ret) return ret;
+            osfs_inode->i_blocks++;
+            
+            // Zero out
+            block_addr = sb_info->data_blocks + double_indirect_block[double_idx] * BLOCK_SIZE;
+            memset(block_addr, 0, BLOCK_SIZE);
+        }
+
+        // Physical data block
+        block_addr = sb_info->data_blocks + double_indirect_block[double_idx] * BLOCK_SIZE;
+        indirect_block = (uint32_t *)block_addr;
+
+        if (indirect_block[single_idx] == 0) {
+            if (!allocate) return -1;
+            ret = osfs_alloc_data_block(sb_info, &indirect_block[single_idx]);
+            if (ret) return ret;
+            osfs_inode->i_blocks++;
+        }
+        
+        *phys_block = indirect_block[single_idx];
+        return 0;
+    }
+
+    return -EFBIG; // File too large
+}
+
 static ssize_t osfs_read(struct file *filp, char __user *buf, size_t len, loff_t *ppos)
 {
     struct inode *inode = file_inode(filp);
     struct osfs_inode *osfs_inode = inode->i_private;
     struct osfs_sb_info *sb_info = inode->i_sb->s_fs_info;
     void *data_block;
-    ssize_t bytes_read;
-
-    // If the file has not been allocated a data block, it indicates the file is empty
-    if (osfs_inode->i_blocks == 0)
-        return 0;
+    ssize_t bytes_read = 0;
+    uint32_t block_index;
+    uint32_t offset_in_block;
+    uint32_t phys_block;
+    size_t chunk_len;
+    int ret;
 
     if (*ppos >= osfs_inode->i_size)
         return 0;
@@ -33,75 +140,83 @@ static ssize_t osfs_read(struct file *filp, char __user *buf, size_t len, loff_t
     if (*ppos + len > osfs_inode->i_size)
         len = osfs_inode->i_size - *ppos;
 
-    data_block = sb_info->data_blocks + osfs_inode->i_block * BLOCK_SIZE + *ppos;
-    if (copy_to_user(buf, data_block, len))
-        return -EFAULT;
+    while (len > 0) {
+        block_index = *ppos / BLOCK_SIZE;
+        offset_in_block = *ppos % BLOCK_SIZE;
+        
+        ret = osfs_get_block(osfs_inode, sb_info, block_index, &phys_block, 0);
+        if (ret < 0) {
+            // Sparse file handling (reading unallocated block returns 0s)
+             if (clear_user(buf, len))
+                return -EFAULT;
+             *ppos += len;
+             bytes_read += len;
+             break;
+        }
 
-    *ppos += len;
-    bytes_read = len;
+        chunk_len = BLOCK_SIZE - offset_in_block;
+        if (chunk_len > len)
+            chunk_len = len;
+
+        data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE + offset_in_block;
+        if (copy_to_user(buf, data_block, chunk_len))
+            return -EFAULT;
+
+        *ppos += chunk_len;
+        buf += chunk_len;
+        len -= chunk_len;
+        bytes_read += chunk_len;
+    }
 
     return bytes_read;
 }
 
-
-/**
- * Function: osfs_write
- * Description: Writes data to a file.
- * Inputs:
- *   - filp: The file pointer representing the file to write to.
- *   - buf: The user-space buffer containing the data to write.
- *   - len: The number of bytes to write.
- *   - ppos: The file position pointer.
- * Returns:
- *   - The number of bytes written on success.
- *   - -EFAULT if copying data from user space fails.
- *   - Adjusted length if the write exceeds the block size.
- */
 static ssize_t osfs_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
 {
-    // Step 1: Retrieve the inode and filesystem information
     struct inode *inode = file_inode(filp);
     struct osfs_inode *osfs_inode = inode->i_private;
     struct osfs_sb_info *sb_info = inode->i_sb->s_fs_info;
     void *data_block;
-    ssize_t bytes_written;
+    ssize_t bytes_written = 0;
+    uint32_t block_index;
+    uint32_t offset_in_block;
+    uint32_t phys_block;
+    size_t chunk_len;
     int ret;
 
-    // Step 2: Check if a data block has been allocated; if not, allocate one
-    if (osfs_inode->i_blocks == 0) {
-        ret = osfs_alloc_data_block(sb_info, &osfs_inode->i_block);
-        if (ret)
-            return ret;
-        osfs_inode->i_blocks = 1;
-        inode->i_blocks = 1;
+    while (len > 0) {
+        block_index = *ppos / BLOCK_SIZE;
+        offset_in_block = *ppos % BLOCK_SIZE;
+
+        ret = osfs_get_block(osfs_inode, sb_info, block_index, &phys_block, 1);
+        if (ret < 0) {
+            if (ret == -EFBIG) return -EFBIG;
+             return ret;
+        }
+
+        chunk_len = BLOCK_SIZE - offset_in_block;
+        if (chunk_len > len)
+            chunk_len = len;
+
+        data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE + offset_in_block;
+        if (copy_from_user(data_block, buf, chunk_len))
+            return -EFAULT;
+
+        *ppos += chunk_len;
+        buf += chunk_len;
+        len -= chunk_len;
+        bytes_written += chunk_len;
     }
-
-    // Step 3: Limit the write length to fit within one data block
-    if (*ppos >= BLOCK_SIZE)
-        return -EFBIG;
-
-    if (*ppos + len > BLOCK_SIZE)
-        len = BLOCK_SIZE - *ppos;
-
-    // Step 4: Write data from user space to the data block
-    data_block = sb_info->data_blocks + osfs_inode->i_block * BLOCK_SIZE + *ppos;
-    if (copy_from_user(data_block, buf, len))
-        return -EFAULT;
-
-    // Step 5: Update inode & osfs_inode attribute
-    *ppos += len;
-    bytes_written = len;
 
     if (*ppos > osfs_inode->i_size) {
         osfs_inode->i_size = *ppos;
         inode->i_size = *ppos;
     }
-    
+
     // Update modification time
     osfs_inode->__i_mtime = current_time(inode);
     mark_inode_dirty(inode);
 
-    // Step 6: Return the number of bytes written
     return bytes_written;
 }
 
